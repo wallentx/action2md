@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+
+# Check if yq is installed
+if ! command -v yq &> /dev/null; then
+  echo "Please install yq to use this script."
+  exit 1
+fi
+
+# Function to extract a simplified name from the uses field
+extract_name_from_uses() {
+  local uses=$1
+  echo "$uses" | awk -F'/' '{print $NF}' | awk -F'@' '{print $1}'
+}
+
+# Function to generate a link for the uses field
+generate_uses_link() {
+  local uses=$1
+  if [[ "$uses" == .* ]]; then
+    # Local file within the repository
+    echo "[$uses](./$uses)"
+  elif [[ "$uses" == *@* ]]; then
+    # GitHub action reference
+    local repo=$(echo "$uses" | awk -F'@' '{print $1}')
+    echo "[$uses](https://github.com/$repo)"
+  else
+    # Assume it's a Docker image or other local action
+    echo "[$uses](https://hub.docker.com/r/$uses)"
+  fi
+}
+
+# Function to convert a YAML list to a Markdown table
+yaml_to_md_table() {
+  local yaml_list=$1
+  local header=$2
+  local prefix=$3
+  echo "$prefix| $header | Value |"
+  echo "$prefix| :------------ | -----:|"
+  echo "$yaml_list" | yq --expression '. as $item ireduce ({}; . * $item) | to_entries | map("'"$prefix"'| \(.key) | \(.value) |")[]'
+
+}
+
+# Function to parse the workflow file
+parse_workflow() {
+  local file=$1
+  local output=$2
+
+  # Check if the input file exists
+  if [ ! -f "$file" ]; then
+    echo "Error: File $file does not exist."
+    exit 1
+  fi
+
+  echo "Parsing workflow file: $file" >&2
+
+  {
+    # Extract workflow name
+    workflow_name=$(yq '.name' "$file" 2>/dev/null || echo "Error: Unable to parse workflow name")
+    if [[ "$workflow_name" == Error* ]]; then
+      echo "$workflow_name" >&2
+      exit 1
+    fi
+    echo "# Workflow: $workflow_name"
+
+    # Extract job names
+    job_names=$(yq '.jobs | keys[]' "$file")
+
+    # Iterate over each job name
+    for job_name in $job_names; do
+      job_label=$(yq ".jobs.${job_name}.name // \"Unnamed job\"" "$file")
+      if [ "$job_label" == "Unnamed job" ]; then
+        job_label="$job_name"
+      fi
+      echo "## Job: $job_label"
+
+      # Check for job 'with' section
+      job_with=$(yq ".jobs.${job_name}.with // null" "$file")
+      if [ "$job_with" != "null" ]; then
+        yaml_to_md_table "$job_with" "Input" "> "
+      fi
+
+      # Get the number of steps
+      num_steps=$(yq ".jobs.${job_name}.steps | length" "$file")
+
+      # Iterate over each step
+      for ((i=0; i<num_steps; i++)); do
+        step=$(yq ".jobs.${job_name}.steps[$i]" "$file")
+        name=$(echo "$step" | yq -r '.name // null')
+        run=$(echo "$step" | yq -r '.run // "No run command"')
+        uses=$(echo "$step" | yq -r '.uses // null')
+        id=$(echo "$step" | yq -r '.id // null')
+        with=$(echo "$step" | yq -o=json '.with // null')
+
+        # If name is empty, use a simplified version of uses
+        if [ "$name" == "null" ] && [ -n "$uses" ]; then
+          name=$(extract_name_from_uses "$uses")
+        elif [ -z "$name" ]; then
+          name="Unnamed step"
+        fi
+
+        echo "> ### $name"
+
+        if [ "$id" != "null" ]; then
+          echo "> <sup>**ID**: _${id//_/\\_}_</sup>"
+        fi
+
+        if [ "$run" != "No run command" ]; then
+          echo '> ```bash'
+          echo "$run" | sed 's/^/> /'
+          echo '> ```'
+        elif [ -n "$uses" ]; then
+          uses_link=$(generate_uses_link "$uses")
+          echo ">  * Uses: $uses_link"
+        else
+          echo ">     + Action: Custom action or script"
+        fi
+
+        if [ "$with" != "null" ]; then
+          yaml_to_md_table "$with" "Input" ">> "
+        fi
+      done
+
+      # Check for job 'outputs' section
+      job_outputs=$(yq ".jobs.${job_name}.outputs // null" "$file")
+      if [ "$job_outputs" != "null" ]; then
+        yaml_to_md_table "$job_outputs" "Output" ">> "
+      fi
+    done
+  } > "$output"
+}
+
+# Function to display usage information
+show_usage() {
+  echo -e "\e[1mUsage: action2md [-o output-file] [-w] <workflow-file>\e[0m"
+  echo
+  echo "Options:"
+  echo -e "  \e[1m-o output-file\e[0m  Specify the output file path"
+  echo -e "  \e[1m-w\e[0m              Write output alongside the action.yml file"
+  echo
+  echo "If no options are specified, the script will output to stdout."
+}
+
+# Main script logic
+output=""
+output_to_file=0
+write_alongside=0
+while getopts ":o:w" opt; do
+  case ${opt} in
+    o )
+      output=$OPTARG
+      output_to_file=1
+      ;;
+    w )
+      write_alongside=1
+      ;;
+    \? )
+      show_usage
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND -1))
+
+if [ -z "$1" ]; then
+  show_usage
+  exit 1
+fi
+
+workflow_file=$1
+
+if [ $write_alongside -eq 1 ]; then
+  output="${workflow_file%.yml}.md"
+elif [ -z "$output" ]; then
+  output="/dev/stdout"
+fi
+
+# Parse the workflow and generate the markdown file
+parse_workflow "$workflow_file" "$output"
+
+if [ $output_to_file -eq 1 ] || [ $write_alongside -eq 1 ]; then
+  echo "Markdown file generated: $output"
+fi
